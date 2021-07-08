@@ -4,166 +4,183 @@ package main
 -====== CSP Parser ======-
 by: Corben Leo (https://corben.io)
 Contributor(s):
-- Riley Johnson (http://therileyjohnson.com)
+- Riley Johnson (https://therileyjohnson.com)
 
 %% Description:
-> Gets Content-Security-Policies for given URL / Domain.
+> Gets Content-Security-Policies for given URLs / Domains
 > Output is in ReconJSON (https://github.com/ReconJSON/ReconJSON)
 */
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
-	"log"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/imroc/req"
+	"github.com/pkg/errors"
 )
 
-// create a struct (a collection of fields) to
-// "unravel" Google's API JSON response into
-type cspStatus struct {
-	Status string `json:"status"`
-	Csp    string `json:"csp"`
-}
-
-// define a map of lists (with type string)
-// globally so any function can access it
-var cspObject map[string][]string
-
 func main() {
-	// initialize the cspObject map
-	cspObject = make(map[string][]string)
-	//adding objects to the map cspObject
-	// this specific data is to make the output
-	// valid ReconJSON
-	cspObject["type"] = append(make([]string, 0), "ServiceDescriptor")
-	cspObject["name"] = append(make([]string, 0), "Content-Security-Policy")
-	cspObject["location"] = append(make([]string, 0), "Header")
+
 	// if user passes a command line argument (the domain  / url to check)
 	if len(os.Args) > 1 {
-		// set the variable to the first argument passed
+		var cspObjectsBytes []byte
 		domain := os.Args[1]
-		// pass the domains to our functions
-		getCSPApi(domain)
-		getCSPHtml(domain)
-		// dump the map into pretty json
-		bytes, _ := json.MarshalIndent(cspObject, "", "    ")
-		// print it to the user
-		fmt.Println(string(bytes))
+		cspObject := make(map[string]interface{})
+
+		// Validate the given URL
+		_, err := url.ParseRequestURI(domain)
+
+		if err != nil {
+			fmt.Println("Domain must be a valid URL")
+			os.Exit(1)
+		}
+
+		cspObject, err = getCSPMap(domain)
+
+		if err != nil {
+			fmt.Println(errors.Wrap(err, "could not retrieve CSP Information"))
+			os.Exit(1)
+		}
+
+		// Pump the map into pretty printed json
+		cspObjectsBytes, err = json.MarshalIndent(cspObject, "", "    ")
+
+		if err != nil {
+			fmt.Println(errors.Wrap(err, "error formatting output JSON"))
+			os.Exit(1)
+		}
+
+		// Print it to the user
+		fmt.Println(string(cspObjectsBytes))
 	} else {
-		// if no domain or url is passed
-		// show the usage to the user.
+		// if no domain or url is passed show the usage to the user.
 		fmt.Println("[+] Usage: cspparse https://www.facebook.com")
 	}
 }
 
-func getCSPApi(domain string) string {
-	// set the parameters of the POST request
-	// to url=<domain>
-	params := req.Param{
-		"url": domain,
-	}
-	url := "https://csp-evaluator.withgoogle.com/getCSP"
-	// make the request
-	req.SetTimeout(2 * 1000 * 1000 * 1000)
-	r, err := req.Post(url, params)
+func getCSPApi(domain string, cspObject map[string]interface{}) error {
+	// Need to set a timeout because the default request client has none
+	client := &http.Client{Timeout: 3 * time.Second}
+	requestURL := fmt.Sprintf("https://csp-evaluator.withgoogle.com/getCSP?url=%s", url.QueryEscape(domain))
+
+	// Make a POST request to the endpoint, no content-type nor request body needed
+	resp, err := client.Post(requestURL, "", nil)
+
 	if err != nil {
-		fmt.Printf("Error making request:\n%s\n", err)
-		os.Exit(1)
+		return errors.Wrap(err, "error making request to csp-evaluator")
 	}
 
-	resp := r.Response()
-	// close the connection
+	// Defer closing the connection until after we leave the function
 	defer resp.Body.Close()
-	// declare the variable c with the type
-	// cspStatus (from the struct on line 29)
-	var c cspStatus
-	// JSON Decode Google's CSP response from JSON
-	// into the struct
-	err = json.NewDecoder(resp.Body).Decode(&c)
+
+	// create an anonymous struct to marshall the JSON from Google's API
+	cspStatus := struct {
+		Status string `json:"status"`
+		Csp    string `json:"csp"`
+	}{}
+
+	// Marshall Google's CSP response JSON into the struct
+	err = json.NewDecoder(resp.Body).Decode(&cspStatus)
 
 	if err != nil {
-		fmt.Printf("Error decoding response JSON:\n%s\n", err)
-		os.Exit(1)
+		return errors.Wrap(err, "error decoding response JSON")
 	}
 
-	// check if Google gave us status:"ok"
-	// which implies there is a CSP.
-	if c.Status == "ok" {
-		// split the CSP into rules by the ; separator
-		cspResult := strings.Split(c.Csp, ";")
-		for _, result := range cspResult {
-			if result != "" {
-				// split the rule by the first space to get valid JSON
-				rules := strings.Split(result, " ")
-				// ex: default-src * data: blob:; -> "default-src": ["*","data:","blob:"],
-				cspObject[rules[0]] = append(make([]string, 0), rules[1:]...)
-			}
+	// If Google gave did not give us 'status: "ok"' there is not a CSP
+	if cspStatus.Status != "ok" {
+		// No CSP for the domain given
+		return nil
+	}
+
+	// Rules are ';' delimited, split the CSP by ';' into rules
+	// occasionally they are delimited by '; ', so we replace it
+	catch := strings.Replace(cspStatus.Csp, "; ", ";", -1)
+	cspResult := strings.Split(catch, ";")
+
+	for _, result := range cspResult {
+		if result != "" {
+			// Split the rule by the first space to get valid JSON
+			rules := strings.Split(result, " ")
+
+			// ex: default-src * data: blob:; -> "default-src": ["*","data:","blob:"],
+			cspObject[rules[0]] = append(make([]string, 0), rules[1:]...)
 		}
-
 	}
-	return ""
+
+	return nil
 }
-func getCSPHtml(domain string) string {
-	// set the variable to the response body
-	// from the function request()
-	htmlCode := request(domain)
-	// use goquery to parse the HTML.
-	doc, err := goquery.NewDocumentFromReader(strings.NewReader((htmlCode)))
-	if err != nil {
-		log.Fatal(err)
-	}
-	// find all <meta> tags to see if there is a CSP.
-	doc.Find("meta").Each(func(i int, s *goquery.Selection) {
-		// if we find a <meta> tag with the
-		// attribute http-equiv set to "Content-Security-Policy"
-		if name, _ := s.Attr("http-equiv"); name == "Content-Security-Policy" {
-			// grab the CSP rule from the "content=" attribute
-			description, _ := s.Attr("content")
-			// delete spaces trailing after semicolons before splitting
-			delSpace := strings.Replace(description, "; ", ";", -1)
-			// split the CSP into rules by the ; separator
-			cspResult := strings.Split(delSpace, ";")
 
-			for _, result := range cspResult {
-				if result != "" {
-					// split the rule by the first space to get valid JSON
-					rules := strings.Split(result, " ")
-					// ex: default-src * data: blob:; -> "default-src": ["*","data:","blob:"],
-					cspObject[rules[0]] = append(make([]string, 0), rules[1:]...)
+func getCSPHtml(domain string, cspObject map[string]interface{}) error {
+	// Need to set a timeout because the default request client has none
+	client := &http.Client{Timeout: 3 * time.Second}
+
+	resp, err := client.Get(domain)
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+
+	if err != nil {
+		return errors.Wrap(err, "could not parse HTML from domain")
+	}
+
+	// Find all '<meta>' tags to see if there is a CSP
+	doc.Find("meta").Each(func(i int, s *goquery.Selection) {
+		// Check if <meta> tag has the attribute http-equiv set to "Content-Security-Policy"
+		if name, _ := s.Attr("http-equiv"); name == "Content-Security-Policy" {
+			// Grab the CSP rule from the "content" attribute
+			description, exists := s.Attr("content")
+
+			// If the 'content' attr exists on the tag
+			if exists {
+				// Delete spaces trailing after semicolons before splitting
+				delSpace := strings.Replace(description, "; ", ";", -1)
+
+				// Split the CSP into rules by the ; separator
+				cspResult := strings.Split(delSpace, ";")
+
+				for _, result := range cspResult {
+					if result != "" {
+						// Split the rule by the first space to get valid JSON
+						rules := strings.Split(result, " ")
+
+						// Ex: default-src * data: blob:; -> "default-src": ["*","data:","blob:"],
+						cspObject[rules[0]] = append(make([]string, 0), rules[1:]...)
+					}
 				}
 			}
 		}
 	})
-	return ""
+
+	return nil
 }
-func request(url string) string {
-	// make a GET request to the target domain / URL
-	if url != "" {
-		req.SetTimeout(2 * 1000 * 1000 * 1000)
-		r, err := req.Get(url)
 
-		if err != nil {
-			fmt.Printf("Error making request:\n%s\n", err)
-			os.Exit(1)
-		}
+func getCSPMap(domain string) (map[string]interface{}, error) {
+	// Create the cspObject map
+	cspObject := make(map[string]interface{})
 
-		resp := r.Response()
-		// close the connection
-		defer resp.Body.Close()
-		// read the response body from the target
-		bodyBytes, err2 := ioutil.ReadAll(resp.Body)
-		if err2 != nil {
-			fmt.Printf("Error: %s\n", err2)
-		} else {
-			bodyString := string(bodyBytes)
-			// return the response body
-			return bodyString
-		}
+	// Adding objects to the map cspObject, this
+	// specific data is to make the output valid ReconJSON
+	cspObject["type"] = "ServiceDescriptor"
+	cspObject["name"] = "httpCsp"
+	cspObject["location"] = "Header"
+
+	// Pass the domain and cspObject to our functions
+	err := getCSPApi(domain, cspObject)
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not get CSP information for %s from Google API", domain)
 	}
-	return ""
+
+	// Check the domain's HTML for meta tags with more information
+	err = getCSPHtml(domain, cspObject)
+
+	if err != nil {
+		return nil, errors.Wrapf(err, "could not get CSP information from %s HTML", domain)
+	}
+
+	return cspObject, nil
 }
